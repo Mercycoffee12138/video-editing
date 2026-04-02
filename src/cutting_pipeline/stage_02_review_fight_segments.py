@@ -159,6 +159,7 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
             "reviewed_count": 0,
             "accepted_count": len(candidates),
             "top_segments": candidates,
+            "calm_segments": list(fight_segments_payload.get("calm_segments") or []),
             "reviewed_segments": [],
         }
         output_path = config.paths.build_dir / "stage_02_reviewed_fight_segments.json"
@@ -199,6 +200,7 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
             segment["review"]["accepted_by_relaxation"] for segment in reviewed_segments
         ),
         "top_segments": top_segments,
+        "calm_segments": list(fight_segments_payload.get("calm_segments") or []),
         "reviewed_segments": reviewed_segments,
     }
     output_path = config.paths.build_dir / "stage_02_reviewed_fight_segments.json"

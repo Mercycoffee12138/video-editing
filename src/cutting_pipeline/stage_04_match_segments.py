@@ -44,6 +44,40 @@ def select_highlight_cluster(
     return best_selection
 
 
+def _merge_unique_highlights(highlights: list[dict]) -> list[dict]:
+    deduped: dict[float, dict] = {}
+    for highlight in highlights:
+        deduped[float(highlight["time"])] = highlight
+    return sorted(deduped.values(), key=lambda item: item["time"])
+
+
+def enrich_selected_highlights(
+    track: dict,
+    selected_highlights: list[dict],
+    config: MatchConfig,
+) -> list[dict]:
+    if not selected_highlights or not config.use_full_track_duration:
+        return selected_highlights
+
+    track_duration = float(track["duration"])
+    all_highlights = list(track["highlights"])
+    enriched = list(selected_highlights)
+
+    late_window_start = track_duration * 0.8
+    end_window_start = track_duration * 0.92
+
+    late_candidates = [item for item in all_highlights if float(item["time"]) >= late_window_start]
+    end_candidates = [item for item in all_highlights if float(item["time"]) >= end_window_start]
+
+    if late_candidates:
+        enriched.append(max(late_candidates, key=lambda item: float(item["score"])))
+    if end_candidates:
+        enriched.append(max(end_candidates, key=lambda item: float(item["score"])))
+
+    enriched = _merge_unique_highlights(enriched)
+    return enriched
+
+
 def build_timeline_durations(
     audio_start: float,
     audio_end: float,
@@ -90,6 +124,131 @@ def _target_intensity(
     return max(0.0, min(1.0, intensity))
 
 
+def _target_chunk_duration(
+    center_time: float,
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    config: MatchConfig,
+) -> float:
+    intensity = _target_intensity(center_time, audio_start, audio_end, selected_highlights)
+    peak_window_seconds = min(5.0, max((audio_end - audio_start) * 0.08, 2.0))
+    peak_proximity = 0.0
+    for highlight in selected_highlights:
+        distance = abs(center_time - float(highlight["time"]))
+        peak_proximity = max(peak_proximity, max(0.0, 1.0 - (distance / peak_window_seconds)))
+
+    # Keep calmer passages longer, and tighten cuts near musical peaks.
+    compression = max(0.0, (intensity - 0.35) / 0.65)
+    compression = min(1.0, compression + (peak_proximity * 0.35))
+    duration_span = config.max_clip_seconds - config.min_clip_seconds
+    target_duration = config.max_clip_seconds - (duration_span * 0.9 * compression)
+    return max(config.min_clip_seconds, min(config.max_clip_seconds, target_duration))
+
+
+def _make_chunk(
+    start: float,
+    end: float,
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+) -> dict:
+    center_time = (start + end) / 2.0
+    return {
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "duration": round(end - start, 3),
+        "target_intensity": round(
+            _target_intensity(center_time, audio_start, audio_end, selected_highlights),
+            4,
+        ),
+    }
+
+
+def _rebalance_timeline_chunks(
+    timeline: list[dict],
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    config: MatchConfig,
+) -> list[dict]:
+    rebalanced: list[dict] = []
+    for chunk in timeline:
+        start = float(chunk["start"])
+        end = float(chunk["end"])
+        duration = end - start
+        if duration <= config.max_clip_seconds + 1e-6:
+            rebalanced.append(chunk)
+            continue
+
+        split_count = max(2, math.ceil(duration / config.max_clip_seconds))
+        split_duration = duration / split_count
+        cursor = start
+        for split_index in range(split_count):
+            next_end = end if split_index == split_count - 1 else cursor + split_duration
+            rebalanced.append(
+                _make_chunk(
+                    cursor,
+                    next_end,
+                    audio_start,
+                    audio_end,
+                    selected_highlights,
+                )
+            )
+            cursor = next_end
+    return rebalanced
+
+
+def _accelerate_high_intensity_chunks(
+    timeline: list[dict],
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    config: MatchConfig,
+) -> list[dict]:
+    accelerated: list[dict] = []
+    total_duration = max(audio_end - audio_start, 1e-6)
+
+    for chunk in timeline:
+        duration = float(chunk["duration"])
+        intensity = float(chunk["target_intensity"])
+        progress = ((float(chunk["start"]) + float(chunk["end"])) * 0.5 - audio_start) / total_duration
+
+        should_split = (
+            duration >= max(config.min_clip_seconds * 2.2, 2.6)
+            and intensity >= 0.66
+            and progress >= 0.56
+        )
+        if not should_split:
+            accelerated.append(chunk)
+            continue
+
+        split_count = 2
+        if duration >= max(config.min_clip_seconds * 2.8, 3.2) and intensity >= 0.72 and progress >= 0.68:
+            split_count = 3
+
+        split_duration = duration / split_count
+        if split_duration < config.min_clip_seconds:
+            accelerated.append(chunk)
+            continue
+
+        cursor = float(chunk["start"])
+        for split_index in range(split_count):
+            next_end = float(chunk["end"]) if split_index == split_count - 1 else cursor + split_duration
+            accelerated.append(
+                _make_chunk(
+                    cursor,
+                    next_end,
+                    audio_start,
+                    audio_end,
+                    selected_highlights,
+                )
+            )
+            cursor = next_end
+
+    return accelerated
+
+
 def build_timeline_chunks(
     audio_start: float,
     audio_end: float,
@@ -100,92 +259,147 @@ def build_timeline_chunks(
     raw_gaps = [end - start for start, end in zip(cut_points, cut_points[1:])]
 
     timeline: list[dict] = []
-    buffer = 0.0
-    buffer_start = audio_start
+    cursor = audio_start
     for gap in raw_gaps:
-        buffer += gap
-        if buffer < config.min_clip_seconds:
-            continue
-        chunk_count = max(1, math.ceil(buffer / config.max_clip_seconds))
-        chunk_duration = buffer / chunk_count
-        for chunk_index in range(chunk_count):
-            chunk_start = buffer_start + (chunk_duration * chunk_index)
-            chunk_end = chunk_start + chunk_duration
-            center_time = (chunk_start + chunk_end) / 2.0
-            timeline.append(
-                {
-                    "start": round(chunk_start, 3),
-                    "end": round(chunk_end, 3),
-                    "duration": round(chunk_duration, 3),
-                    "target_intensity": round(
-                        _target_intensity(center_time, audio_start, audio_end, selected_highlights),
-                        4,
-                    ),
-                }
-            )
-        buffer_start += buffer
-        buffer = 0.0
+        region_start = cursor
+        region_end = cursor + gap
+        remaining = gap
 
-    if buffer > 0:
-        if timeline:
-            timeline[-1]["end"] = round(timeline[-1]["end"] + buffer, 3)
-            timeline[-1]["duration"] = round(timeline[-1]["duration"] + buffer, 3)
-        else:
-            chunk_end = buffer_start + buffer
-            timeline.append(
-                {
-                    "start": round(buffer_start, 3),
-                    "end": round(chunk_end, 3),
-                    "duration": round(buffer, 3),
-                    "target_intensity": round(
-                        _target_intensity((buffer_start + chunk_end) / 2.0, audio_start, audio_end, selected_highlights),
-                        4,
-                    ),
-                }
+        while remaining > 0:
+            center_time = region_start + (remaining / 2.0)
+            target_duration = _target_chunk_duration(
+                center_time,
+                audio_start,
+                audio_end,
+                selected_highlights,
+                config,
             )
 
-    return timeline
+            if remaining <= config.max_clip_seconds:
+                if remaining < config.min_clip_seconds and timeline:
+                    timeline[-1]["end"] = round(timeline[-1]["end"] + remaining, 3)
+                    timeline[-1]["duration"] = round(timeline[-1]["duration"] + remaining, 3)
+                    remaining = 0.0
+                    break
+                chunk_duration = remaining
+            else:
+                chunk_duration = min(remaining, target_duration)
+                leftover = remaining - chunk_duration
+                if 0.0 < leftover < config.min_clip_seconds:
+                    chunk_duration = remaining
+
+            chunk_end = region_start + chunk_duration
+            timeline.append(_make_chunk(region_start, chunk_end, audio_start, audio_end, selected_highlights))
+            remaining = round(region_end - chunk_end, 6)
+            region_start = chunk_end
+
+        cursor = region_end
+
+    timeline = _rebalance_timeline_chunks(
+        timeline,
+        audio_start,
+        audio_end,
+        selected_highlights,
+        config,
+    )
+    return _accelerate_high_intensity_chunks(
+        timeline,
+        audio_start,
+        audio_end,
+        selected_highlights,
+        config,
+    )
 
 
 def assign_clips(
     fight_segments: list[dict],
+    calm_segments: list[dict],
     timeline_chunks: list[dict],
     config: MatchConfig,
 ) -> list[MatchedClipRecord]:
-    ranked_segments = sorted(fight_segments, key=lambda item: item["score"], reverse=True)
-    if not ranked_segments:
+    ranked_fight_segments = sorted(fight_segments, key=lambda item: item["score"], reverse=True)
+    ranked_calm_segments = sorted(calm_segments, key=lambda item: item["score"], reverse=True)
+    if not ranked_fight_segments and not ranked_calm_segments:
         raise ValueError("No fight segments are available for clip assignment.")
 
-    segment_scores = [float(segment["score"]) for segment in ranked_segments]
-    min_score = min(segment_scores)
-    max_score = max(segment_scores)
-    spread = max(max_score - min_score, 1e-8)
+    fight_scores = [float(segment["score"]) for segment in ranked_fight_segments] or [0.0]
+    calm_scores = [float(segment["score"]) for segment in ranked_calm_segments] or [0.0]
+    fight_min = min(fight_scores)
+    fight_spread = max(max(fight_scores) - fight_min, 1e-8)
+    calm_min = min(calm_scores)
+    calm_spread = max(max(calm_scores) - calm_min, 1e-8)
 
-    remaining_segments = list(ranked_segments)
+    remaining_fight_segments = list(ranked_fight_segments)
+    remaining_calm_segments = list(ranked_calm_segments)
     reuse_count: defaultdict[str, int] = defaultdict(int)
     clips: list[MatchedClipRecord] = []
 
     for order, chunk in enumerate(timeline_chunks, start=1):
-        if not remaining_segments:
-            remaining_segments = list(ranked_segments)
-
         duration = float(chunk["duration"])
         target_intensity = float(chunk["target_intensity"])
+        if target_intensity <= 0.36 and ranked_calm_segments:
+            candidate_pool_name = "calm"
+        elif (target_intensity >= 0.52 and ranked_fight_segments) or not ranked_calm_segments:
+            candidate_pool_name = "fight"
+        else:
+            candidate_pool_name = "mixed"
+
+        if candidate_pool_name == "fight":
+            if not remaining_fight_segments:
+                remaining_fight_segments = list(ranked_fight_segments)
+            candidate_segments = [("fight", index, segment) for index, segment in enumerate(remaining_fight_segments)]
+        elif candidate_pool_name == "calm":
+            if not remaining_calm_segments:
+                remaining_calm_segments = list(ranked_calm_segments)
+            candidate_segments = [("calm", index, segment) for index, segment in enumerate(remaining_calm_segments)]
+        else:
+            if not remaining_calm_segments:
+                remaining_calm_segments = list(ranked_calm_segments)
+            if not remaining_fight_segments:
+                remaining_fight_segments = list(ranked_fight_segments)
+            candidate_segments = [
+                ("calm", index, segment) for index, segment in enumerate(remaining_calm_segments)
+            ] + [
+                ("fight", index, segment) for index, segment in enumerate(remaining_fight_segments)
+            ]
+
+        if not candidate_segments:
+            if ranked_fight_segments:
+                remaining_fight_segments = list(ranked_fight_segments)
+                candidate_segments = [("fight", index, segment) for index, segment in enumerate(remaining_fight_segments)]
+            else:
+                remaining_calm_segments = list(ranked_calm_segments)
+                candidate_segments = [("calm", index, segment) for index, segment in enumerate(remaining_calm_segments)]
+
+        best_pool = candidate_segments[0][0]
         best_index = 0
         best_score = float("-inf")
-        for index, segment in enumerate(remaining_segments):
-            normalized_segment_score = (float(segment["score"]) - min_score) / spread
-            intensity_match = 1.0 - abs(normalized_segment_score - target_intensity)
+        for pool_name, index, segment in candidate_segments:
+            if pool_name == "fight":
+                normalized_segment_score = (float(segment["score"]) - fight_min) / fight_spread
+                desired_level = target_intensity
+                pool_bias = 0.08 if target_intensity >= 0.52 else 0.0
+            else:
+                normalized_segment_score = (float(segment["score"]) - calm_min) / calm_spread
+                desired_level = 1.0 - target_intensity
+                pool_bias = 0.08 if target_intensity <= 0.36 else 0.0
+
+            intensity_match = 1.0 - abs(normalized_segment_score - desired_level)
             reuse_penalty = 1.0 + (reuse_count[segment["source_path"]] * config.source_reuse_penalty)
             weighted_score = (
                 (intensity_match * 0.7)
                 + (normalized_segment_score * 0.3)
+                + pool_bias
             ) / reuse_penalty
             if weighted_score > best_score:
                 best_score = weighted_score
+                best_pool = pool_name
                 best_index = index
 
-        selected_segment = remaining_segments.pop(best_index)
+        if best_pool == "fight":
+            selected_segment = remaining_fight_segments.pop(best_index)
+        else:
+            selected_segment = remaining_calm_segments.pop(best_index)
         reuse_count[selected_segment["source_path"]] += 1
 
         max_start = max(selected_segment["video_duration"] - duration, 0.0)
@@ -212,6 +426,7 @@ def build_plan_for_track(track: dict, fight_segments: list[dict], config: MatchC
     selected_highlights = select_highlight_cluster(track["highlights"], config)
     if not selected_highlights:
         return None
+    selected_highlights = enrich_selected_highlights(track, selected_highlights, config)
 
     if config.use_full_track_duration:
         audio_start = 0.0
@@ -225,7 +440,8 @@ def build_plan_for_track(track: dict, fight_segments: list[dict], config: MatchC
     if not timeline_durations:
         return None
 
-    clips = assign_clips(fight_segments, timeline_chunks, config)
+    calm_segments = track.get("calm_segments_override") or []
+    clips = assign_clips(fight_segments, calm_segments, timeline_chunks, config)
     highlight_records = [MusicHighlightRecord(**highlight) for highlight in selected_highlights]
 
     average_segment_score = sum(clip.segment_score for clip in clips) / max(len(clips), 1)
@@ -253,6 +469,7 @@ def run(
 ) -> dict:
     tracks = music_highlights_payload["tracks"]
     fight_segments = fight_segments_payload["top_segments"]
+    calm_segments = fight_segments_payload.get("calm_segments") or []
 
     requested_music = config.match.selected_music_filename
     if requested_music:
@@ -271,7 +488,9 @@ def run(
     for index, track in enumerate(tracks, start=1):
         progress = (index - 1) / max(len(tracks), 1)
         reporter.update(progress, f"Matching clips to {track['music_path']} ({index}/{len(tracks)}).")
-        plan = build_plan_for_track(track, fight_segments, config.match)
+        track_with_calm_segments = dict(track)
+        track_with_calm_segments["calm_segments_override"] = calm_segments
+        plan = build_plan_for_track(track_with_calm_segments, fight_segments, config.match)
         if plan is not None:
             plans.append(plan)
 

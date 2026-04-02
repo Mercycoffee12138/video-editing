@@ -21,6 +21,11 @@ class MotionConfig:
     threshold_floor: float = 0.045
     min_segment_seconds: float = 1.2
     merge_gap_seconds: float = 0.7
+    calm_threshold_quantile: float = 0.35
+    calm_threshold_ceiling: float = 0.03
+    calm_min_segment_seconds: float = 1.8
+    calm_max_segment_seconds: float = 5.5
+    calm_merge_gap_seconds: float = 1.2
 
 
 @dataclass(frozen=True)
