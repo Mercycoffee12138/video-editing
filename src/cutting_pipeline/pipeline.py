@@ -7,6 +7,7 @@ from .json_io import read_json
 from .progress import ProgressReporter
 from . import stage_01_trim_videos
 from . import stage_02_detect_fight_segments
+from . import stage_02_review_fight_segments
 from . import stage_03_detect_music_highlights
 from . import stage_04_match_segments
 from . import stage_05_render_final_video
@@ -15,6 +16,7 @@ from . import stage_05_render_final_video
 STAGE_SEQUENCE = (
     "stage_01_trim_videos",
     "stage_02_detect_fight_segments",
+    "stage_02_review_fight_segments",
     "stage_03_detect_music_highlights",
     "stage_04_match_segments",
     "stage_05_render_final_video",
@@ -25,6 +27,7 @@ def _artifact_path(project_root: Path, stage_name: str) -> Path:
     artifact_map = {
         "stage_01_trim_videos": project_root / "build" / "stage_01_trim_manifest.json",
         "stage_02_detect_fight_segments": project_root / "build" / "stage_02_fight_segments.json",
+        "stage_02_review_fight_segments": project_root / "build" / "stage_02_reviewed_fight_segments.json",
         "stage_03_detect_music_highlights": project_root / "build" / "stage_03_music_highlights.json",
         "stage_04_match_segments": project_root / "build" / "stage_04_match_plan.json",
     }
@@ -67,6 +70,15 @@ def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") 
     else:
         fight_segments = _load_required_artifact(project_root, "stage_02_detect_fight_segments")
 
+    if STAGE_SEQUENCE.index(start_stage) <= STAGE_SEQUENCE.index("stage_02_review_fight_segments"):
+        reviewed_fight_segments = stage_02_review_fight_segments.run(
+            config,
+            reporter.stage("stage_02_review_fight_segments"),
+            fight_segments,
+        )
+    else:
+        reviewed_fight_segments = _load_required_artifact(project_root, "stage_02_review_fight_segments")
+
     if STAGE_SEQUENCE.index(start_stage) <= STAGE_SEQUENCE.index("stage_03_detect_music_highlights"):
         music_highlights = stage_03_detect_music_highlights.run(
             config,
@@ -79,7 +91,7 @@ def run_pipeline(project_root: Path, start_stage: str = "stage_01_trim_videos") 
         match_payload = stage_04_match_segments.run(
             config,
             reporter.stage("stage_04_match_segments"),
-            fight_segments,
+            reviewed_fight_segments,
             music_highlights,
         )
     else:

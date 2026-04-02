@@ -30,14 +30,17 @@ src/cutting_pipeline/
   progress.py
   stage_01_trim_videos.py
   stage_02_detect_fight_segments.py
+  stage_02_review_fight_segments.py
   stage_03_detect_music_highlights.py
   stage_04_match_segments.py
   stage_05_render_final_video.py
 tests/
+  test_stage_02_review_fight_segments.py
   test_stage_04_match_segments.py
 build/
   stage_01_trim_manifest.json
   stage_02_fight_segments.json
+  stage_02_reviewed_fight_segments.json
   stage_03_music_highlights.json
   stage_04_match_plan.json
   stage_05_final_video.mp4
@@ -64,11 +67,28 @@ python3 stage_00_run_pipeline.py --start-stage stage_03_detect_music_highlights
 
 This will reuse the earlier JSON artifacts in `build/` and continue from stage 03.
 
+## Vision Review
+
+Stage `stage_02_review_fight_segments` uses Qwen VL through the Zhizengzeng
+Alibaba proxy to review the top detected motion segments before music matching.
+It extracts three frames from each candidate clip and asks the model whether
+the scene really looks like a fight or confrontation.
+
+Set your API key before running the pipeline:
+
+```bash
+export ZZZ_API_KEY="your_zhizengzeng_key"
+```
+
+If no API key is set, the review stage is skipped automatically and the pipeline
+falls back to the motion-only fight segments.
+
 ## Main outputs
 
 - `build/stage_01_trimmed_videos/`
 - `build/stage_01_trim_manifest.json`
 - `build/stage_02_fight_segments.json`
+- `build/stage_02_reviewed_fight_segments.json`
 - `build/stage_03_music_highlights.json`
 - `build/stage_04_match_plan.json`
 - `build/stage_05_final_video.mp4`
@@ -77,5 +97,6 @@ This will reuse the earlier JSON artifacts in `build/` and continue from stage 0
 
 - Stage 01 uses fast GOP-aligned trimming with `ffmpeg -c copy` to keep preprocessing efficient.
 - Stage 02 uses low-resolution grayscale frame differences to estimate motion intensity.
+- Stage 02 review uses Qwen VL to reject high-motion clips that do not visually look like fights.
 - Stage 03 uses PCM energy changes to detect music highlight points without extra Python audio packages.
 - Stage 05 re-encodes only the short selected clips for the final output.

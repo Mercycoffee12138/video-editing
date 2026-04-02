@@ -112,3 +112,24 @@ def decode_audio_mono(path: Path, sample_rate: int) -> np.ndarray:
     if samples.size == 0:
         return np.zeros(1, dtype=np.float32)
     return samples / 32768.0
+
+
+def export_video_frame(path: Path, timestamp: float, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{max(timestamp, 0.0):.3f}",
+        "-i",
+        str(path),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        "-y",
+        str(output_path),
+    ]
+    run_command(command)

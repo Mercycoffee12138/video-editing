@@ -47,6 +47,15 @@ class MatchConfig:
 
 
 @dataclass(frozen=True)
+class ReviewConfig:
+    enabled: bool = True
+    max_candidate_segments: int = 100
+    min_confidence: float = 0.55
+    min_accepted_segments: int = 24
+    relaxed_min_confidence: float = 0.35
+
+
+@dataclass(frozen=True)
 class RenderConfig:
     output_width: int = 1920
     output_height: int = 1080
@@ -72,6 +81,7 @@ class PipelinePaths:
     music_source_dir: Path
     build_dir: Path
     stage_01_trim_dir: Path
+    stage_02_review_frames_dir: Path
     stage_05_clip_dir: Path
     stage_05_temp_dir: Path
 
@@ -82,14 +92,16 @@ class PipelineConfig:
     trim: TrimConfig = field(default_factory=TrimConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
     match: MatchConfig = field(default_factory=MatchConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
     stage_windows: tuple[StageWindow, ...] = (
-        StageWindow("stage_01_trim_videos", "Trim Videos", 0.0, 20.0),
-        StageWindow("stage_02_detect_fight_segments", "Detect Fight Segments", 20.0, 45.0),
-        StageWindow("stage_03_detect_music_highlights", "Detect Music Highlights", 45.0, 65.0),
-        StageWindow("stage_04_match_segments", "Match Segments", 65.0, 80.0),
-        StageWindow("stage_05_render_final_video", "Render Final Video", 80.0, 100.0),
+        StageWindow("stage_01_trim_videos", "Trim Videos", 0.0, 18.0),
+        StageWindow("stage_02_detect_fight_segments", "Detect Fight Segments", 18.0, 38.0),
+        StageWindow("stage_02_review_fight_segments", "Review Fight Segments", 38.0, 55.0),
+        StageWindow("stage_03_detect_music_highlights", "Detect Music Highlights", 55.0, 72.0),
+        StageWindow("stage_04_match_segments", "Match Segments", 72.0, 84.0),
+        StageWindow("stage_05_render_final_video", "Render Final Video", 84.0, 100.0),
     )
 
 
@@ -104,6 +116,7 @@ def build_default_config(project_root: Path) -> PipelineConfig:
         music_source_dir=source_root / "music",
         build_dir=build_dir,
         stage_01_trim_dir=build_dir / "stage_01_trimmed_videos",
+        stage_02_review_frames_dir=build_dir / "stage_02_review_frames",
         stage_05_clip_dir=build_dir / "stage_05_render_clips",
         stage_05_temp_dir=build_dir / "stage_05_temp",
     )
