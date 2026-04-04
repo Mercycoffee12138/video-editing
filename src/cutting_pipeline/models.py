@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -25,6 +25,10 @@ class FightSegmentRecord:
     mean_motion: float
     peak_motion: float
     score: float
+    confidence: float = 0.0
+    fight_probability: float = 0.0
+    detection_source: str = "unknown"
+    key_event_times: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,7 @@ class MusicTrackRecord:
     music_path: str
     duration: float
     highlights: list[MusicHighlightRecord]
+    beats: list[MusicHighlightRecord] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,9 @@ class MatchedClipRecord:
     clip_end: float
     duration: float
     segment_score: float
+    source_event_time: float | None = None
+    target_highlight_time: float | None = None
+    alignment_error: float | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +71,7 @@ class MatchPlanRecord:
     timeline_durations: list[float]
     clips: list[MatchedClipRecord]
     plan_score: float
+    selected_beats: list[MusicHighlightRecord] = field(default_factory=list)
 
 
 def to_dict(instance: Any) -> Any:

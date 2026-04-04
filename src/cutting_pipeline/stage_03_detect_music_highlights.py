@@ -5,6 +5,13 @@ from pathlib import Path
 
 import numpy as np
 
+from .audio_features import (
+    frame_metric as _frame_metric,
+    merge_peak_indices as _merge_highlight_indices,
+    moving_average as _moving_average,
+    normalize_robust as _normalize,
+    pick_peaks as _pick_peaks,
+)
 from .config import PipelineConfig
 from .ffmpeg_tools import decode_audio_mono, get_media_duration
 from .json_io import write_json
@@ -12,64 +19,28 @@ from .models import MusicHighlightRecord, MusicTrackRecord
 from .progress import StageReporter
 
 
-def _moving_average(values: np.ndarray, window_size: int) -> np.ndarray:
-    if window_size <= 1 or values.size == 0:
-        return values
-    kernel = np.ones(window_size, dtype=np.float32) / float(window_size)
-    return np.convolve(values, kernel, mode="same")
-
-
-def _frame_metric(samples: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
-    if samples.size < frame_length:
-        padded = np.pad(samples, (0, frame_length - samples.size))
-        return np.asarray([float(np.sqrt(np.mean(np.square(padded)) + 1e-8))], dtype=np.float32)
-
-    frame_values: list[float] = []
-    for start in range(0, samples.size - frame_length + 1, hop_length):
-        frame = samples[start : start + frame_length]
-        frame_values.append(float(np.sqrt(np.mean(np.square(frame)) + 1e-8)))
-    return np.asarray(frame_values, dtype=np.float32)
-
-
-def _normalize(values: np.ndarray) -> np.ndarray:
-    if values.size == 0:
-        return values
-    center = float(np.median(values))
-    spread = float(np.percentile(values, 75) - np.percentile(values, 25))
-    if spread < 1e-8:
-        spread = float(values.std()) + 1e-8
-    return (values - center) / spread
-
-
-def _pick_peaks(
-    scores: np.ndarray,
-    min_distance_frames: int,
-    limit: int,
-    threshold: float,
-) -> list[int]:
-    if scores.size < 3:
-        return []
-
-    candidates = [
-        index
-        for index in range(1, len(scores) - 1)
-        if scores[index] >= scores[index - 1]
-        and scores[index] > scores[index + 1]
-        and scores[index] >= threshold
-    ]
-
-    kept: list[int] = []
-    for index in sorted(candidates, key=lambda item: scores[item], reverse=True):
-        if all(abs(index - existing) >= min_distance_frames for existing in kept):
-            kept.append(index)
-        if len(kept) >= limit:
-            break
-
-    return sorted(kept)
-
-
 def _relative(path: Path, project_root: Path) -> str:
     return str(path.relative_to(project_root))
+
+
+def _records_from_indices(
+    indices: list[int],
+    seconds_per_frame: float,
+    scores: np.ndarray,
+    energy: np.ndarray,
+    accent: np.ndarray,
+) -> list[MusicHighlightRecord]:
+    records: list[MusicHighlightRecord] = []
+    for peak_index in indices:
+        records.append(
+            MusicHighlightRecord(
+                time=round(peak_index * seconds_per_frame, 3),
+                score=round(float(scores[peak_index]), 6),
+                energy=round(float(energy[peak_index]), 6),
+                accent=round(float(accent[peak_index]), 6),
+            )
+        )
+    return records
 
 
 def _analyze_track(path: Path, config: PipelineConfig) -> MusicTrackRecord:
@@ -88,40 +59,81 @@ def _analyze_track(path: Path, config: PipelineConfig) -> MusicTrackRecord:
         0.0,
     )
 
-    combined = (_normalize(energy_focus) * 0.4) + (_normalize(accent_focus) * 0.6)
+    normalized_energy = _normalize(energy_focus).astype(np.float32)
+    normalized_accent = _normalize(accent_focus).astype(np.float32)
+    combined = (normalized_energy * 0.4) + (normalized_accent * 0.6)
     combined = _moving_average(combined.astype(np.float32), 5)
 
     threshold = max(
         float(np.quantile(combined, config.audio.peak_threshold_quantile)),
         float(combined.mean() + combined.std() * 0.7),
     )
+    support_scores = _moving_average(((normalized_accent * 0.7) + (normalized_energy * 0.3)).astype(np.float32), 3)
+    support_threshold = max(
+        float(np.quantile(support_scores, min(config.audio.peak_threshold_quantile, 0.84))),
+        float(support_scores.mean() + support_scores.std() * 0.35),
+    )
     min_distance_frames = max(
         1,
         int(round(config.audio.min_peak_distance_seconds * config.audio.sample_rate / config.audio.hop_length)),
     )
-    peak_indices = _pick_peaks(
+    primary_indices = _pick_peaks(
         combined,
         min_distance_frames=min_distance_frames,
         limit=config.audio.top_highlights,
         threshold=threshold,
     )
+    secondary_indices = _pick_peaks(
+        support_scores,
+        min_distance_frames=max(1, min_distance_frames // 2),
+        limit=config.audio.top_highlights * 2,
+        threshold=support_threshold,
+    )
+    peak_indices = _merge_highlight_indices(
+        primary_indices=primary_indices,
+        secondary_indices=secondary_indices,
+        scores=np.maximum(combined, support_scores),
+        min_distance_frames=min_distance_frames,
+        limit=config.audio.top_highlights,
+    )
 
-    highlights: list[MusicHighlightRecord] = []
     seconds_per_frame = config.audio.hop_length / config.audio.sample_rate
-    for peak_index in peak_indices:
-        highlights.append(
-            MusicHighlightRecord(
-                time=round(peak_index * seconds_per_frame, 3),
-                score=round(float(combined[peak_index]), 6),
-                energy=round(float(energy[peak_index]), 6),
-                accent=round(float(accent[peak_index]), 6),
-            )
-        )
+    highlights = _records_from_indices(
+        peak_indices,
+        seconds_per_frame,
+        combined,
+        energy,
+        accent,
+    )
+
+    beat_scores = _moving_average(((normalized_accent * 0.82) + (normalized_energy * 0.18)).astype(np.float32), 3)
+    beat_threshold = max(
+        float(np.quantile(beat_scores, config.audio.beat_threshold_quantile)),
+        float(beat_scores.mean() + beat_scores.std() * 0.12),
+    )
+    beat_distance_frames = max(
+        1,
+        int(round(config.audio.beat_min_distance_seconds * config.audio.sample_rate / config.audio.hop_length)),
+    )
+    beat_indices = _pick_peaks(
+        beat_scores,
+        min_distance_frames=beat_distance_frames,
+        limit=config.audio.beat_top_candidates,
+        threshold=beat_threshold,
+    )
+    beats = _records_from_indices(
+        beat_indices,
+        seconds_per_frame,
+        beat_scores,
+        energy,
+        accent,
+    )
 
     return MusicTrackRecord(
         music_path=_relative(path, config.paths.project_root),
         duration=round(get_media_duration(path), 3),
         highlights=highlights,
+        beats=beats,
     )
 
 

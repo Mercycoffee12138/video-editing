@@ -83,8 +83,12 @@ def build_timeline_durations(
     audio_end: float,
     selected_highlights: list[dict],
     config: MatchConfig,
+    beat_points: list[dict] | None = None,
 ) -> list[float]:
-    return [chunk["duration"] for chunk in build_timeline_chunks(audio_start, audio_end, selected_highlights, config)]
+    return [
+        chunk["duration"]
+        for chunk in build_timeline_chunks(audio_start, audio_end, selected_highlights, config, beat_points=beat_points)
+    ]
 
 
 def _normalized_highlight_scores(selected_highlights: list[dict]) -> list[float]:
@@ -154,6 +158,22 @@ def _make_chunk(
     selected_highlights: list[dict],
 ) -> dict:
     center_time = (start + end) / 2.0
+    sync_target_time = None
+    sync_target_position = None
+    for highlight in selected_highlights:
+        highlight_time = float(highlight["time"])
+        if abs(end - highlight_time) <= 1e-3 and end < audio_end - 1e-3:
+            sync_target_time = round(end, 3)
+            sync_target_position = "end"
+            break
+    if sync_target_time is None:
+        for highlight in selected_highlights:
+            highlight_time = float(highlight["time"])
+            if abs(start - highlight_time) <= 1e-3 and start > audio_start + 1e-3:
+                sync_target_time = round(start, 3)
+                sync_target_position = "start"
+                break
+
     return {
         "start": round(start, 3),
         "end": round(end, 3),
@@ -162,7 +182,110 @@ def _make_chunk(
             _target_intensity(center_time, audio_start, audio_end, selected_highlights),
             4,
         ),
+        "sync_target_time": sync_target_time,
+        "sync_target_position": sync_target_position,
     }
+
+
+def _build_beat_timeline_chunks(
+    audio_start: float,
+    audio_end: float,
+    selected_highlights: list[dict],
+    beat_points: list[dict],
+    config: MatchConfig,
+) -> list[dict]:
+    filtered_beats = sorted(
+        {
+            round(float(beat["time"]), 3): beat
+            for beat in beat_points
+            if audio_start < float(beat["time"]) < audio_end
+        }.values(),
+        key=lambda item: float(item["time"]),
+    )
+    if not filtered_beats:
+        return []
+
+    cut_points = [audio_start] + [float(beat["time"]) for beat in filtered_beats] + [audio_end]
+    timeline: list[dict] = []
+    min_duration = config.beat_cut_min_clip_seconds
+    max_duration = config.beat_cut_max_clip_seconds
+
+    chunk_start = cut_points[0]
+    for next_cut in cut_points[1:]:
+        proposed_end = next_cut
+        proposed_duration = proposed_end - chunk_start
+        if proposed_duration < min_duration and timeline:
+            timeline[-1]["end"] = round(proposed_end, 3)
+            timeline[-1]["duration"] = round(float(timeline[-1]["end"]) - float(timeline[-1]["start"]), 3)
+            chunk_start = proposed_end
+            continue
+
+        while proposed_duration > max_duration:
+            split_end = min(chunk_start + max_duration, proposed_end)
+            timeline.append(_make_chunk(chunk_start, split_end, audio_start, audio_end, selected_highlights))
+            chunk_start = split_end
+            proposed_duration = proposed_end - chunk_start
+
+        if proposed_duration <= 0.0:
+            continue
+        timeline.append(_make_chunk(chunk_start, proposed_end, audio_start, audio_end, selected_highlights))
+        chunk_start = proposed_end
+
+    return timeline
+
+
+def _segment_event_times(segment: dict) -> list[float]:
+    event_times = sorted(
+        round(float(value), 3)
+        for value in (segment.get("key_event_times") or [])
+        if isinstance(value, (int, float))
+    )
+    return event_times or [round(float(segment["peak_time"]), 3)]
+
+
+def _alignment_plan(
+    segment: dict,
+    duration: float,
+    chunk: dict,
+) -> tuple[float, float, float, float | None, float]:
+    max_start = max(float(segment["video_duration"]) - duration, 0.0)
+    sync_target_time = chunk.get("sync_target_time")
+    sync_target_position = chunk.get("sync_target_position")
+    if sync_target_position == "start":
+        target_position = 0.0
+    elif sync_target_position == "end":
+        target_position = duration
+    else:
+        target_position = duration * 0.5
+
+    best_clip_start = 0.0
+    best_source_event_time = float(segment["peak_time"])
+    best_error = float("inf")
+
+    for source_event_time in _segment_event_times(segment):
+        if sync_target_position == "start":
+            ideal_start = source_event_time
+        elif sync_target_position == "end":
+            ideal_start = source_event_time - duration
+        else:
+            ideal_start = source_event_time - (duration * 0.5)
+
+        clip_start = max(0.0, min(ideal_start, max_start))
+        actual_event_position = source_event_time - clip_start
+        alignment_error = abs(actual_event_position - target_position)
+        if alignment_error < best_error:
+            best_error = alignment_error
+            best_clip_start = clip_start
+            best_source_event_time = source_event_time
+
+    clip_end = best_clip_start + duration
+    return (
+        round(best_clip_start, 3),
+        round(clip_end, 3),
+        round(best_source_event_time, 3),
+        round(float(sync_target_time), 3) if sync_target_time is not None else None,
+        round(best_error, 3),
+    )
 
 
 def _rebalance_timeline_chunks(
@@ -254,7 +377,19 @@ def build_timeline_chunks(
     audio_end: float,
     selected_highlights: list[dict],
     config: MatchConfig,
+    beat_points: list[dict] | None = None,
 ) -> list[dict]:
+    if config.beat_cut_enabled and beat_points:
+        beat_timeline = _build_beat_timeline_chunks(
+            audio_start,
+            audio_end,
+            selected_highlights,
+            beat_points,
+            config,
+        )
+        if beat_timeline:
+            return beat_timeline
+
     cut_points = [audio_start] + [highlight["time"] for highlight in selected_highlights] + [audio_end]
     raw_gaps = [end - start for start, end in zip(cut_points, cut_points[1:])]
 
@@ -317,15 +452,25 @@ def assign_clips(
     timeline_chunks: list[dict],
     config: MatchConfig,
 ) -> list[MatchedClipRecord]:
-    ranked_fight_segments = sorted(fight_segments, key=lambda item: item["score"], reverse=True)
+    def _fight_probability_value(segment: dict) -> float:
+        return float(segment.get("fight_probability", segment.get("confidence", segment.get("score", 0.0))))
+
+    ranked_fight_segments = sorted(
+        fight_segments,
+        key=lambda item: (_fight_probability_value(item), float(item["score"])),
+        reverse=True,
+    )
     ranked_calm_segments = sorted(calm_segments, key=lambda item: item["score"], reverse=True)
     if not ranked_fight_segments and not ranked_calm_segments:
         raise ValueError("No fight segments are available for clip assignment.")
 
     fight_scores = [float(segment["score"]) for segment in ranked_fight_segments] or [0.0]
     calm_scores = [float(segment["score"]) for segment in ranked_calm_segments] or [0.0]
+    fight_probabilities = [_fight_probability_value(segment) for segment in ranked_fight_segments] or [0.0]
     fight_min = min(fight_scores)
     fight_spread = max(max(fight_scores) - fight_min, 1e-8)
+    fight_probability_min = min(fight_probabilities)
+    fight_probability_spread = max(max(fight_probabilities) - fight_probability_min, 1e-8)
     calm_min = min(calm_scores)
     calm_spread = max(max(calm_scores) - calm_min, 1e-8)
 
@@ -377,19 +522,48 @@ def assign_clips(
         for pool_name, index, segment in candidate_segments:
             if pool_name == "fight":
                 normalized_segment_score = (float(segment["score"]) - fight_min) / fight_spread
+                normalized_fight_probability = (
+                    _fight_probability_value(segment) - fight_probability_min
+                ) / fight_probability_spread
+                if target_intensity >= 0.6:
+                    probability_blend = 0.55
+                    normalized_segment_level = (
+                        normalized_segment_score * (1.0 - probability_blend)
+                    ) + (
+                        normalized_fight_probability * probability_blend
+                    )
+                    segment_score_weight = 0.12
+                    fight_probability_weight = 0.22
+                else:
+                    normalized_segment_level = normalized_segment_score
+                    segment_score_weight = 0.2
+                    fight_probability_weight = 0.0
                 desired_level = target_intensity
                 pool_bias = 0.08 if target_intensity >= 0.52 else 0.0
             else:
                 normalized_segment_score = (float(segment["score"]) - calm_min) / calm_spread
+                normalized_fight_probability = 0.0
+                normalized_segment_level = normalized_segment_score
+                segment_score_weight = 0.18
+                fight_probability_weight = 0.0
                 desired_level = 1.0 - target_intensity
                 pool_bias = 0.08 if target_intensity <= 0.36 else 0.0
 
-            intensity_match = 1.0 - abs(normalized_segment_score - desired_level)
+            intensity_match = 1.0 - abs(normalized_segment_level - desired_level)
+            _, _, _, _, alignment_error = _alignment_plan(segment, duration, chunk)
+            alignment_score = 1.0 - min(alignment_error / max(duration, 1e-6), 1.0)
+            has_key_events = bool(segment.get("key_event_times"))
+            event_bonus = 0.05 if has_key_events else 0.0
+            if has_key_events and chunk.get("sync_target_time") is not None:
+                event_bonus += 0.08
             reuse_penalty = 1.0 + (reuse_count[segment["source_path"]] * config.source_reuse_penalty)
             weighted_score = (
-                (intensity_match * 0.7)
-                + (normalized_segment_score * 0.3)
+                (intensity_match * 0.38)
+                + (normalized_segment_score * segment_score_weight)
+                + (normalized_fight_probability * fight_probability_weight)
+                + (alignment_score * 0.28)
                 + pool_bias
+                + event_bonus
             ) / reuse_penalty
             if weighted_score > best_score:
                 best_score = weighted_score
@@ -402,20 +576,24 @@ def assign_clips(
             selected_segment = remaining_calm_segments.pop(best_index)
         reuse_count[selected_segment["source_path"]] += 1
 
-        max_start = max(selected_segment["video_duration"] - duration, 0.0)
-        centered_start = selected_segment["peak_time"] - (duration / 2.0)
-        clip_start = max(0.0, min(centered_start, max_start))
-        clip_end = clip_start + duration
+        clip_start, clip_end, source_event_time, target_highlight_time, alignment_error = _alignment_plan(
+            selected_segment,
+            duration,
+            chunk,
+        )
 
         clips.append(
             MatchedClipRecord(
                 order=order,
                 source_path=selected_segment["source_path"],
                 trimmed_path=selected_segment["trimmed_path"],
-                clip_start=round(clip_start, 3),
-                clip_end=round(clip_end, 3),
+                clip_start=clip_start,
+                clip_end=clip_end,
                 duration=round(duration, 3),
                 segment_score=round(selected_segment["score"], 6),
+                source_event_time=source_event_time,
+                target_highlight_time=target_highlight_time,
+                alignment_error=alignment_error,
             )
         )
 
@@ -427,6 +605,7 @@ def build_plan_for_track(track: dict, fight_segments: list[dict], config: MatchC
     if not selected_highlights:
         return None
     selected_highlights = enrich_selected_highlights(track, selected_highlights, config)
+    selected_beats = list(track.get("beats") or [])
 
     if config.use_full_track_duration:
         audio_start = 0.0
@@ -435,7 +614,13 @@ def build_plan_for_track(track: dict, fight_segments: list[dict], config: MatchC
         audio_start = max(0.0, selected_highlights[0]["time"] - config.intro_padding_seconds)
         audio_end = min(track["duration"], selected_highlights[-1]["time"] + config.outro_padding_seconds)
 
-    timeline_chunks = build_timeline_chunks(audio_start, audio_end, selected_highlights, config)
+    timeline_chunks = build_timeline_chunks(
+        audio_start,
+        audio_end,
+        selected_highlights,
+        config,
+        beat_points=selected_beats,
+    )
     timeline_durations = [chunk["duration"] for chunk in timeline_chunks]
     if not timeline_durations:
         return None
@@ -443,6 +628,7 @@ def build_plan_for_track(track: dict, fight_segments: list[dict], config: MatchC
     calm_segments = track.get("calm_segments_override") or []
     clips = assign_clips(fight_segments, calm_segments, timeline_chunks, config)
     highlight_records = [MusicHighlightRecord(**highlight) for highlight in selected_highlights]
+    beat_records = [MusicHighlightRecord(**beat) for beat in selected_beats]
 
     average_segment_score = sum(clip.segment_score for clip in clips) / max(len(clips), 1)
     average_highlight_score = sum(highlight.score for highlight in highlight_records) / max(len(highlight_records), 1)
@@ -458,6 +644,7 @@ def build_plan_for_track(track: dict, fight_segments: list[dict], config: MatchC
         timeline_durations=timeline_durations,
         clips=clips,
         plan_score=plan_score,
+        selected_beats=beat_records,
     )
 
 

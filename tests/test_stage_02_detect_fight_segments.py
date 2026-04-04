@@ -14,6 +14,7 @@ from cutting_pipeline.stage_02_detect_fight_segments import (  # noqa: E402
     _calm_segment_score,
     _exposure_balance,
     _frame_quality_metrics,
+    _parse_coarse_review_json,
 )
 
 
@@ -53,6 +54,17 @@ class DetectFightSegmentsTests(unittest.TestCase):
         )
 
         self.assertGreater(strong, weak)
+
+    def test_parse_coarse_review_json_clamps_ratios(self) -> None:
+        parsed = _parse_coarse_review_json(
+            '{"contains_fight": true, "confidence": 0.81, '
+            '"active_start_ratio": -0.2, "active_end_ratio": 1.6, "summary": "两人近身互殴"}'
+        )
+
+        self.assertTrue(parsed["contains_fight"])
+        self.assertEqual(parsed["confidence"], 0.81)
+        self.assertEqual(parsed["active_start_ratio"], 0.0)
+        self.assertEqual(parsed["active_end_ratio"], 1.0)
 
 
 if __name__ == "__main__":

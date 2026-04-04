@@ -33,21 +33,50 @@ class AudioConfig:
     sample_rate: int = 22050
     frame_length: int = 2048
     hop_length: int = 1024
-    min_peak_distance_seconds: float = 4.0
-    top_highlights: int = 12
-    peak_threshold_quantile: float = 0.9
+    min_peak_distance_seconds: float = 2.2
+    top_highlights: int = 20
+    peak_threshold_quantile: float = 0.8
+    beat_min_distance_seconds: float = 0.3
+    beat_top_candidates: int = 220
+    beat_threshold_quantile: float = 0.66
+
+
+@dataclass(frozen=True)
+class FightAIConfig:
+    coarse_window_seconds: float = 8.0
+    coarse_stride_seconds: float = 4.0
+    coarse_frames_per_window: int = 4
+    coarse_min_confidence: float = 0.42
+    coarse_merge_gap_seconds: float = 1.4
+    fine_anchor_frames: int = 5
+    fine_event_context_seconds: float = 0.12
+    fine_max_event_candidates: int = 6
+    audio_candidate_min_spacing_seconds: float = 0.22
+    audio_candidate_peak_quantile: float = 0.86
+    max_key_events_per_segment: int = 6
+    refined_audio_candidate_min_spacing_seconds: float = 0.12
+    refined_audio_candidate_peak_quantile: float = 0.74
+    refined_max_event_candidates: int = 8
+    refined_visual_analysis_fps: int = 12
+    refined_visual_candidate_min_spacing_seconds: float = 0.12
+    collision_preview_lead_seconds: float = 0.35
+    collision_preview_tail_seconds: float = 0.35
+    collision_preview_min_duration_seconds: float = 0.5
 
 
 @dataclass(frozen=True)
 class MatchConfig:
-    selected_music_filename: str | None = "011.MP3"
+    selected_music_filename: str | None = "002.mp3"
     use_full_track_duration: bool = True
-    highlight_cluster_window_seconds: float = 60.0
-    max_highlights_per_track: int = 10
+    highlight_cluster_window_seconds: float = 42.0
+    max_highlights_per_track: int = 16
     intro_padding_seconds: float = 4.0
     outro_padding_seconds: float = 6.0
-    min_clip_seconds: float = 0.8
-    max_clip_seconds: float = 4.8
+    min_clip_seconds: float = 0.5
+    max_clip_seconds: float = 3.0
+    beat_cut_enabled: bool = True
+    beat_cut_min_clip_seconds: float = 0.18
+    beat_cut_max_clip_seconds: float = 1.25
     source_reuse_penalty: float = 0.25
 
 
@@ -97,6 +126,7 @@ class PipelineConfig:
     trim: TrimConfig = field(default_factory=TrimConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
+    fight_ai: FightAIConfig = field(default_factory=FightAIConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
     match: MatchConfig = field(default_factory=MatchConfig)
     render: RenderConfig = field(default_factory=RenderConfig)

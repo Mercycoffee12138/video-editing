@@ -127,6 +127,7 @@ class MatchStageTests(unittest.TestCase):
                 "video_duration": 100.0,
                 "peak_time": 30.0,
                 "score": 2.5,
+                "fight_probability": 0.95,
             },
         ]
         calm_segments = [
@@ -149,6 +150,69 @@ class MatchStageTests(unittest.TestCase):
         )
 
         self.assertEqual(clips[0].source_path, "source/video/fight.mp4")
+
+    def test_assign_clips_prefers_higher_fight_probability_when_scores_are_close(self) -> None:
+        config = MatchConfig(source_reuse_penalty=0.25)
+        fight_segments = [
+            {
+                "source_path": "source/video/high_prob.mp4",
+                "trimmed_path": "build/stage_01_trimmed_videos/high_prob.mp4",
+                "video_duration": 100.0,
+                "peak_time": 30.0,
+                "score": 2.1,
+                "fight_probability": 0.95,
+            },
+            {
+                "source_path": "source/video/high_score.mp4",
+                "trimmed_path": "build/stage_01_trimmed_videos/high_score.mp4",
+                "video_duration": 100.0,
+                "peak_time": 30.0,
+                "score": 2.2,
+                "fight_probability": 0.55,
+            },
+        ]
+
+        clips = assign_clips(
+            fight_segments,
+            [],
+            [{"duration": 2.0, "target_intensity": 0.8}],
+            config,
+        )
+
+        self.assertEqual(clips[0].source_path, "source/video/high_prob.mp4")
+
+    def test_assign_clips_aligns_key_event_to_highlight_boundary_when_available(self) -> None:
+        config = MatchConfig(source_reuse_penalty=0.25)
+        fight_segments = [
+            {
+                "source_path": "source/video/fight.mp4",
+                "trimmed_path": "build/stage_01_trimmed_videos/fight.mp4",
+                "video_duration": 100.0,
+                "peak_time": 30.0,
+                "key_event_times": [41.2],
+                "score": 2.5,
+            },
+        ]
+
+        clips = assign_clips(
+            fight_segments,
+            [],
+            [
+                {
+                    "duration": 3.0,
+                    "target_intensity": 0.85,
+                    "sync_target_time": 12.0,
+                    "sync_target_position": "end",
+                },
+            ],
+            config,
+        )
+
+        self.assertEqual(clips[0].clip_start, 38.2)
+        self.assertEqual(clips[0].clip_end, 41.2)
+        self.assertEqual(clips[0].source_event_time, 41.2)
+        self.assertEqual(clips[0].target_highlight_time, 12.0)
+        self.assertEqual(clips[0].alignment_error, 0.0)
 
     def test_build_timeline_chunks_raises_intensity_near_highlights(self) -> None:
         config = MatchConfig(min_clip_seconds=0.8, max_clip_seconds=4.0)
@@ -238,6 +302,29 @@ class MatchStageTests(unittest.TestCase):
         ]
         self.assertTrue(target_window)
         self.assertLess(max(target_window), 4.0)
+
+    def test_build_timeline_chunks_prefers_dense_beat_boundaries_when_enabled(self) -> None:
+        config = MatchConfig(
+            beat_cut_enabled=True,
+            beat_cut_min_clip_seconds=0.24,
+            beat_cut_max_clip_seconds=1.8,
+            min_clip_seconds=0.65,
+            max_clip_seconds=3.8,
+        )
+        selected_highlights = [
+            {"time": 4.0, "score": 1.0, "energy": 0.1, "accent": 0.1},
+            {"time": 8.0, "score": 1.5, "energy": 0.1, "accent": 0.1},
+        ]
+        beat_points = [
+            {"time": 1.0, "score": 0.8, "energy": 0.1, "accent": 0.3},
+            {"time": 2.0, "score": 0.8, "energy": 0.1, "accent": 0.3},
+            {"time": 3.0, "score": 0.8, "energy": 0.1, "accent": 0.3},
+            {"time": 4.0, "score": 0.8, "energy": 0.1, "accent": 0.3},
+        ]
+
+        chunks = build_timeline_chunks(0.0, 5.0, selected_highlights, config, beat_points=beat_points)
+
+        self.assertEqual([chunk["end"] for chunk in chunks[:-1]], [1.0, 2.0, 3.0, 4.0])
 
 
 if __name__ == "__main__":
