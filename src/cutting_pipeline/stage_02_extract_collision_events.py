@@ -6,21 +6,70 @@ from .progress import StageReporter
 from .stage_02_review_fight_segments import (
     _export_collision_event_previews,
     _extract_refined_collision_candidates,
-    _resolve_collision_event_times,
 )
 
 
 def _enrich_segment_with_collision_events(config: PipelineConfig, segment: dict) -> dict:
     payload = dict(segment)
     collision_events = _extract_refined_collision_candidates(config, payload)
-    key_event_times = _resolve_collision_event_times(collision_events, config)
-
     review = dict(payload.get("review") or {})
     review["collision_events"] = collision_events
-    review["key_event_times"] = key_event_times
+    review["key_event_times"] = []
     payload["review"] = review
-    payload["key_event_times"] = key_event_times
+    payload["key_event_times"] = []
     return payload
+
+
+def _select_diversified_key_event_times(
+    segments: list[dict],
+    config: PipelineConfig,
+) -> list[dict]:
+    candidate_lists: list[list[dict]] = []
+    for segment in segments:
+        ranked_candidates = sorted(
+            list((segment.get("review") or {}).get("collision_events") or []),
+            key=lambda item: float(item.get("score", 0.0)),
+            reverse=True,
+        )
+        candidate_lists.append(ranked_candidates[: config.fight_ai.max_key_events_per_segment])
+
+    selected_times_by_segment: list[list[float]] = [[] for _ in segments]
+    pass_index = 0
+    while pass_index < config.fight_ai.max_key_events_per_segment:
+        any_selected = False
+        for segment_index, candidates in enumerate(candidate_lists):
+            if pass_index >= len(candidates):
+                continue
+
+            candidate = candidates[pass_index]
+            candidate_time = round(float(candidate["time"]), 3)
+            candidate_score = float(candidate.get("score", 0.0))
+            existing_times = selected_times_by_segment[segment_index]
+            if candidate_time in existing_times:
+                continue
+
+            if pass_index > 0 and candidates:
+                best_score = float(candidates[0].get("score", 0.0))
+                minimum_repeat_score = best_score * config.fight_ai.collision_repeat_score_ratio
+                if candidate_score < minimum_repeat_score:
+                    continue
+
+            existing_times.append(candidate_time)
+            any_selected = True
+
+        if not any_selected:
+            break
+        pass_index += 1
+
+    enriched_segments: list[dict] = []
+    for segment, selected_times in zip(segments, selected_times_by_segment):
+        payload = dict(segment)
+        review = dict(payload.get("review") or {})
+        review["key_event_times"] = sorted(selected_times)
+        payload["review"] = review
+        payload["key_event_times"] = sorted(selected_times)
+        enriched_segments.append(payload)
+    return enriched_segments
 
 
 def run(
@@ -36,6 +85,8 @@ def run(
         progress = (index - 1) / max(len(top_segments), 1)
         reporter.update(progress, f"Extracting collision events for segment {index}/{len(top_segments)}.")
         enriched_segments.append(_enrich_segment_with_collision_events(config, segment))
+
+    enriched_segments = _select_diversified_key_event_times(enriched_segments, config)
 
     enriched_segments.sort(
         key=lambda item: (

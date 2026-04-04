@@ -59,6 +59,7 @@ class FightAIConfig:
     refined_max_event_candidates: int = 8
     refined_visual_analysis_fps: int = 12
     refined_visual_candidate_min_spacing_seconds: float = 0.12
+    collision_repeat_score_ratio: float = 0.82
     collision_preview_lead_seconds: float = 0.35
     collision_preview_tail_seconds: float = 0.35
     collision_preview_min_duration_seconds: float = 0.5

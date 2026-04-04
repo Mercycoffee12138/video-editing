@@ -10,7 +10,10 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cutting_pipeline.config import build_default_config  # noqa: E402
-from cutting_pipeline.stage_02_extract_collision_events import _enrich_segment_with_collision_events  # noqa: E402
+from cutting_pipeline.stage_02_extract_collision_events import (  # noqa: E402
+    _enrich_segment_with_collision_events,
+    _select_diversified_key_event_times,
+)
 
 
 class ExtractCollisionEventsTests(unittest.TestCase):
@@ -34,9 +37,52 @@ class ExtractCollisionEventsTests(unittest.TestCase):
         ):
             enriched = _enrich_segment_with_collision_events(config, segment)
 
-        self.assertEqual(enriched["key_event_times"], [11.2, 12.6])
-        self.assertEqual(enriched["review"]["key_event_times"], [11.2, 12.6])
+        self.assertEqual(enriched["key_event_times"], [])
+        self.assertEqual(enriched["review"]["key_event_times"], [])
         self.assertEqual(len(enriched["review"]["collision_events"]), 2)
+
+    def test_select_diversified_key_event_times_delays_repeats_until_other_segments_get_first_pick(self) -> None:
+        config = build_default_config(PROJECT_ROOT)
+        segments = [
+            {
+                "review": {
+                    "collision_events": [
+                        {"time": 10.1, "score": 4.0},
+                        {"time": 10.4, "score": 3.6},
+                        {"time": 10.9, "score": 2.0},
+                    ]
+                }
+            },
+            {
+                "review": {
+                    "collision_events": [
+                        {"time": 20.2, "score": 3.5},
+                    ]
+                }
+            },
+        ]
+
+        diversified = _select_diversified_key_event_times(segments, config)
+
+        self.assertEqual(diversified[0]["key_event_times"], [10.1, 10.4])
+        self.assertEqual(diversified[1]["key_event_times"], [20.2])
+
+    def test_select_diversified_key_event_times_filters_weak_repeats(self) -> None:
+        config = build_default_config(PROJECT_ROOT)
+        segments = [
+            {
+                "review": {
+                    "collision_events": [
+                        {"time": 10.1, "score": 4.0},
+                        {"time": 10.4, "score": 2.5},
+                    ]
+                }
+            }
+        ]
+
+        diversified = _select_diversified_key_event_times(segments, config)
+
+        self.assertEqual(diversified[0]["key_event_times"], [10.1])
 
 
 if __name__ == "__main__":
