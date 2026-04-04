@@ -83,7 +83,7 @@ class MatchConfig:
 @dataclass(frozen=True)
 class ReviewConfig:
     enabled: bool = True
-    max_candidate_segments: int = 100
+    max_candidate_segments: int = 300
     min_confidence: float = 0.55
     min_accepted_segments: int = 24
     relaxed_min_confidence: float = 0.35
@@ -133,10 +133,11 @@ class PipelineConfig:
     stage_windows: tuple[StageWindow, ...] = (
         StageWindow("stage_01_trim_videos", "Trim Videos", 0.0, 18.0),
         StageWindow("stage_02_detect_fight_segments", "Detect Fight Segments", 18.0, 38.0),
-        StageWindow("stage_02_review_fight_segments", "Review Fight Segments", 38.0, 55.0),
-        StageWindow("stage_03_detect_music_highlights", "Detect Music Highlights", 55.0, 72.0),
-        StageWindow("stage_04_match_segments", "Match Segments", 72.0, 84.0),
-        StageWindow("stage_05_render_final_video", "Render Final Video", 84.0, 100.0),
+        StageWindow("stage_02_review_fight_segments", "Review Fight Segments", 38.0, 50.0),
+        StageWindow("stage_02_extract_collision_events", "Extract Collision Events", 50.0, 60.0),
+        StageWindow("stage_03_detect_music_highlights", "Detect Music Highlights", 60.0, 75.0),
+        StageWindow("stage_04_match_segments", "Match Segments", 75.0, 87.0),
+        StageWindow("stage_05_render_final_video", "Render Final Video", 87.0, 100.0),
     )
 
 

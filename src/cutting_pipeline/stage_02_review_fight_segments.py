@@ -14,40 +14,21 @@ from .progress import StageReporter
 from .qwen_vision import QwenVisionContentBlockedError, analyze_images, load_config_from_env
 
 
-def _review_prompt(segment_duration: float, anchor_count: int, candidate_events: list[dict[str, Any]]) -> str:
-    if candidate_events:
-        candidate_lines = "\n".join(
-            (
-                f"{candidate['candidate_index']}. {candidate['time']:.3f}s, "
-                f"音频冲击强度={candidate['score']:.3f}, "
-                f"accent={candidate['audio_accent']:.3f}, "
-                f"energy={candidate['audio_energy']:.3f}"
-            )
-            for candidate in candidate_events
-        )
-    else:
-        candidate_lines = "无音频候选卡点。"
-
+def _review_prompt(segment_duration: float, anchor_count: int) -> str:
     return (
         "你在做打斗片段的第二轮精细定位。"
-        "这个候选片段已经大概率属于打斗，但边界和卡点还不够精确。"
+        "这个候选片段已经大概率属于打斗，但边界还不够精确。"
         "所有图片都按顺序输入。"
-        f"前 {anchor_count} 张是整段候选片段从头到尾等间隔抽帧。"
-        "后续每 3 张为一个候选卡点的 前一瞬间 / 当前瞬间 / 后一瞬间。"
-        "请结合整段抽帧和每个候选点对应的音频冲击强度，判断："
+        f"这 {anchor_count} 张是整段候选片段从头到尾等间隔抽帧。"
+        "请只基于这些画面判断："
         "1. 这段是否真的属于明确打斗；"
-        "2. 真正的打斗开始和结束大致位于当前候选片段内部什么位置；"
-        "3. 哪些候选点是真正适合卡点的相撞、击打、武器碰撞、爆炸闪光或强动作接触瞬间。"
+        "2. 真正的打斗开始和结束大致位于当前候选片段内部什么位置。"
         "请只返回 JSON，不要输出 markdown 代码块，不要补充解释。"
         'JSON 格式必须是: {"contains_fight": true, "confidence": 0.0, '
         '"refined_start_ratio": 0.0, "refined_end_ratio": 1.0, '
-        '"peak_candidate_index": 0, "key_event_candidate_indices": [1, 3], '
         '"summary": "...", "ocr_text": "..."}。'
         "refined_start_ratio 和 refined_end_ratio 是相对当前候选片段起止位置的 0 到 1。"
-        "peak_candidate_index 是最能代表这一段爆点的候选编号，没有就填 0。"
         f"当前候选片段时长约 {segment_duration:.2f} 秒。"
-        "\n候选卡点列表:\n"
-        f"{candidate_lines}"
     )
 
 
@@ -66,22 +47,6 @@ def _parse_review_json(text: str) -> dict[str, Any]:
     start_ratio = max(0.0, min(float(parsed.get("refined_start_ratio", 0.0)), 1.0))
     end_ratio = max(start_ratio, min(float(parsed.get("refined_end_ratio", 1.0)), 1.0))
 
-    raw_key_indices = parsed.get("key_event_candidate_indices") or []
-    key_event_candidate_indices: list[int] = []
-    if isinstance(raw_key_indices, list):
-        for value in raw_key_indices:
-            try:
-                candidate_index = int(value)
-            except (TypeError, ValueError):
-                continue
-            if candidate_index > 0 and candidate_index not in key_event_candidate_indices:
-                key_event_candidate_indices.append(candidate_index)
-
-    try:
-        peak_candidate_index = int(parsed.get("peak_candidate_index", 0))
-    except (TypeError, ValueError):
-        peak_candidate_index = 0
-
     return {
         "contains_fight": bool(parsed.get("contains_fight")),
         "confidence": round(float(parsed.get("confidence", 0.0)), 4),
@@ -89,8 +54,6 @@ def _parse_review_json(text: str) -> dict[str, Any]:
         "ocr_text": str(parsed.get("ocr_text", "")).strip(),
         "refined_start_ratio": round(start_ratio, 4),
         "refined_end_ratio": round(end_ratio, 4),
-        "peak_candidate_index": max(0, peak_candidate_index),
-        "key_event_candidate_indices": key_event_candidate_indices,
     }
 
 
@@ -389,14 +352,11 @@ def _extract_review_frames(
     config: PipelineConfig,
     segment: dict,
     segment_index: int,
-    candidate_events: list[dict[str, Any]],
-) -> tuple[list[Path], list[Path]]:
+) -> list[Path]:
     trimmed_path = config.paths.project_root / segment["trimmed_path"]
     segment_dir = config.paths.stage_02_review_frames_dir / "review" / f"segment_{segment_index:03d}"
     segment_dir.mkdir(parents=True, exist_ok=True)
 
-    start = float(segment["start"])
-    end = float(segment["end"])
     anchor_paths: list[Path] = []
     for frame_index, timestamp in enumerate(
         _segment_anchor_times(segment, config.fight_ai.fine_anchor_frames),
@@ -405,39 +365,7 @@ def _extract_review_frames(
         frame_path = segment_dir / f"anchor_{frame_index:02d}.jpg"
         export_video_frame(trimmed_path, timestamp, frame_path)
         anchor_paths.append(frame_path)
-
-    event_paths: list[Path] = []
-    event_context = config.fight_ai.fine_event_context_seconds
-    for candidate in candidate_events:
-        candidate_index = int(candidate["candidate_index"])
-        base_time = float(candidate["time"])
-        for suffix, offset in (("before", -event_context), ("hit", 0.0), ("after", event_context)):
-            timestamp = _clamp_timestamp(base_time + offset, start, end)
-            frame_path = segment_dir / f"event_{candidate_index:02d}_{suffix}.jpg"
-            export_video_frame(trimmed_path, timestamp, frame_path)
-            event_paths.append(frame_path)
-
-    return anchor_paths, event_paths
-
-
-def _resolve_key_event_times(
-    review: dict[str, Any],
-    candidate_events: list[dict[str, Any]],
-    config: PipelineConfig,
-) -> list[float]:
-    candidate_lookup = {
-        int(candidate["candidate_index"]): round(float(candidate["time"]), 3)
-        for candidate in candidate_events
-    }
-    times: list[float] = []
-    for candidate_index in review["key_event_candidate_indices"]:
-        event_time = candidate_lookup.get(candidate_index)
-        if event_time is None or event_time in times:
-            continue
-        times.append(event_time)
-        if len(times) >= config.fight_ai.max_key_events_per_segment:
-            break
-    return sorted(times)
+    return anchor_paths
 
 
 def _resolve_collision_event_times(
@@ -470,18 +398,11 @@ def _refined_bounds(segment: dict, review: dict[str, Any]) -> tuple[float, float
 
 def _content_blocked_review(
     segment: dict,
-    candidate_events: list[dict[str, Any]],
     config: PipelineConfig,
     error_message: str,
 ) -> dict[str, Any]:
-    ranked_candidates = sorted(candidate_events, key=lambda item: float(item["score"]), reverse=True)
-    key_event_candidate_indices = [
-        int(candidate["candidate_index"])
-        for candidate in ranked_candidates[: min(3, config.fight_ai.max_key_events_per_segment)]
-    ]
-    peak_candidate_index = key_event_candidate_indices[0] if key_event_candidate_indices else 0
     segment_confidence = float(segment.get("confidence", 0.0))
-    fallback_confidence = max(config.review.min_confidence, segment_confidence, 0.72 if ranked_candidates else 0.6)
+    fallback_confidence = max(config.review.min_confidence, segment_confidence, 0.72)
     return {
         "contains_fight": True,
         "confidence": round(fallback_confidence, 4),
@@ -489,8 +410,6 @@ def _content_blocked_review(
         "ocr_text": "",
         "refined_start_ratio": 0.0,
         "refined_end_ratio": 1.0,
-        "peak_candidate_index": peak_candidate_index,
-        "key_event_candidate_indices": key_event_candidate_indices,
         "content_blocked": True,
         "fallback_reason": error_message,
     }
@@ -501,41 +420,22 @@ def _build_reviewed_segment(
     segment: dict,
     review: dict[str, Any],
     frame_paths: list[Path],
-    candidate_events: list[dict[str, Any]],
     config: PipelineConfig,
     accepted: bool,
 ) -> dict[str, Any]:
     payload = dict(segment)
     refined_start, refined_end = _refined_bounds(segment, review)
-    refined_segment = dict(segment)
-    refined_segment["start"] = refined_start
-    refined_segment["end"] = refined_end
-
-    ai_key_event_times = _resolve_key_event_times(review, candidate_events, config)
-    refined_collision_candidates = _extract_refined_collision_candidates(config, refined_segment)
-    collision_key_event_times = _resolve_collision_event_times(refined_collision_candidates, config)
-    key_event_times = collision_key_event_times or ai_key_event_times
     fight_probability = min(
         1.0,
         (
             (float(review["confidence"]) * 0.6)
             + (min(float(segment.get("score", 0.0)) / 20.0, 1.0) * 0.25)
-            + (min(len(key_event_times), 4) * 0.05)
             + (0.15 if review["contains_fight"] else 0.0)
         ),
     )
-
-    candidate_lookup = {
-        int(candidate["candidate_index"]): round(float(candidate["time"]), 3)
-        for candidate in candidate_events
-    }
-    peak_time = float(segment["peak_time"])
-    peak_candidate_index = int(review["peak_candidate_index"])
-    if peak_candidate_index > 0 and peak_candidate_index in candidate_lookup:
-        peak_time = candidate_lookup[peak_candidate_index]
-    elif key_event_times:
-        peak_time = min(key_event_times, key=lambda item: abs(item - float(segment["peak_time"])))
-    peak_time = _clamp_timestamp(peak_time, refined_start, refined_end)
+    peak_time = _clamp_timestamp(float(segment["peak_time"]), refined_start, refined_end)
+    if peak_time <= refined_start + 1e-6 or peak_time >= refined_end - 1e-6:
+        peak_time = (refined_start + refined_end) * 0.5
 
     payload["start"] = refined_start
     payload["end"] = refined_end
@@ -543,7 +443,7 @@ def _build_reviewed_segment(
     payload["confidence"] = round(float(review["confidence"]), 4)
     payload["fight_probability"] = round(fight_probability, 4)
     payload["detection_source"] = "content_block_fallback" if review.get("content_blocked") else "ai_refined"
-    payload["key_event_times"] = key_event_times
+    payload["key_event_times"] = []
     payload["mean_motion"] = round(max(float(segment.get("mean_motion", 0.0)), float(review["confidence"])), 6)
     payload["peak_motion"] = round(max(float(segment.get("peak_motion", 0.0)), float(review["confidence"])), 6)
     payload["review"] = {
@@ -557,11 +457,8 @@ def _build_reviewed_segment(
         "fallback_reason": str(review.get("fallback_reason", "")).strip(),
         "refined_start": refined_start,
         "refined_end": refined_end,
-        "peak_candidate_index": peak_candidate_index,
-        "candidate_events": candidate_events,
-        "collision_events": refined_collision_candidates,
-        "ai_key_event_times": ai_key_event_times,
-        "key_event_times": key_event_times,
+        "ai_key_event_times": [],
+        "key_event_times": [],
         "frame_paths": [str(path.relative_to(project_root)) for path in frame_paths],
     }
 
@@ -569,9 +466,8 @@ def _build_reviewed_segment(
     original_duration = max(float(segment["end"]) - float(segment["start"]), 0.01)
     refined_duration = max(refined_end - refined_start, 0.01)
     duration_adjustment = 0.82 + (0.18 * min(refined_duration / original_duration, 1.0))
-    event_bonus = 1.0 + (min(len(key_event_times), 3) * 0.1)
     if accepted:
-        payload["score"] = round(base_score * duration_adjustment * (0.9 + (review["confidence"] * 0.6)) * event_bonus, 6)
+        payload["score"] = round(base_score * duration_adjustment * (0.9 + (review["confidence"] * 0.6)), 6)
     else:
         payload["score"] = round(base_score * 0.25, 6)
     return payload
@@ -800,16 +696,13 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
         progress = (index - 1) / max(len(candidates), 1)
         reporter.update(progress, f"Refining segment {index}/{len(candidates)}.")
 
-        candidate_events = _extract_audio_candidates(config, segment)
-        anchor_paths, event_paths = _extract_review_frames(config, segment, index, candidate_events)
-        ordered_frames = anchor_paths + event_paths
+        ordered_frames = _extract_review_frames(config, segment, index)
         try:
             response = analyze_images(
                 ordered_frames,
                 _review_prompt(
                     float(segment["end"]) - float(segment["start"]),
-                    anchor_count=len(anchor_paths),
-                    candidate_events=candidate_events,
+                    anchor_count=len(ordered_frames),
                 ),
                 vision_config,
             )
@@ -817,7 +710,7 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
             accepted = review["contains_fight"] and review["confidence"] >= config.review.min_confidence
         except QwenVisionContentBlockedError as exc:
             reporter.update(progress, f"Segment {index}/{len(candidates)} blocked by content inspection, using fallback.")
-            review = _content_blocked_review(segment, candidate_events, config, str(exc))
+            review = _content_blocked_review(segment, config, str(exc))
             accepted = True
         reviewed_segments.append(
             _build_reviewed_segment(
@@ -825,7 +718,6 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
                 segment,
                 review,
                 ordered_frames,
-                candidate_events,
                 config,
                 accepted,
             )
@@ -834,8 +726,6 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
     accepted_segments = _apply_relaxed_acceptance(reviewed_segments, config)
     top_segments = accepted_segments or candidates
     top_segments = sorted(top_segments, key=lambda item: float(item["score"]), reverse=True)
-    collision_event_preview = _export_collision_event_previews(config, reporter, top_segments)
-
     payload = {
         "stage": "stage_02_review_fight_segments",
         "review_enabled": True,
@@ -848,7 +738,6 @@ def run(config: PipelineConfig, reporter: StageReporter, fight_segments_payload:
         "top_segments": top_segments,
         "calm_segments": list(fight_segments_payload.get("calm_segments") or []),
         "reviewed_segments": reviewed_segments,
-        "collision_event_preview": collision_event_preview,
     }
     output_path = config.paths.build_dir / "stage_02_reviewed_fight_segments.json"
     write_json(output_path, payload)
